@@ -296,25 +296,59 @@ sub _process_dmarc_for {
     };
     $self->metric_count( 'dmarc_total', $metric_data );
 
-    # Try as best we can to save a report, but don't stress if it fails.
-    my $rua = eval { $dmarc_result->published()->rua(); };
-    if ($rua) {
-        if ( ! $config->{'no_report'} ) {
-            if ( ! $self->{'skip_report'} ) {
-                eval {
-                    $self->dbgout( 'DMARCReportTo', $rua, LOG_INFO );
-                    $dmarc->save_aggregate();
-                };
-                if ( my $error = $@ ) {
-                    $self->log_error( 'DMARC Report Error ' . $error );
+    push @{ $self->{ 'dmarc_objects'} }, {
+        'dmarc' => $dmarc,
+        'result' => $dmarc_result,
+        'header_domain' => $header_domain,
+    };
+
+
+    return;
+}
+
+sub save_reports {
+    my ( $self ) = @_;
+    my $config = $self->{'config'};
+
+    foreach my $object ( @{ $self->{ 'dmarc_objects' } } ) {
+        my $dmarc = $object->{ 'dmarc' };
+        my $dmarc_result = $object->{ 'result' };
+        my $header_domain = $object->{ 'header_domain' };
+
+        # Try as best we can to save a report, but don't stress if it fails.
+        my $rua = eval { $dmarc_result->published()->rua(); };
+        if ($rua) {
+            if ( ! $config->{'no_report'} ) {
+
+                # Find an address for this domain for skip list checking
+                my $from_headers = $self->{ 'from_headers' };
+                my $matching_address = q{};
+                foreach my $from_header ( @$from_headers ) {
+                    my $from_header_header_addresses = $self->get_addresses_from( $from_header );
+                    foreach my $header_address ( @$from_header_header_addresses ) {
+                        if ( lc $self->get_domain_from( $header_address ) eq $header_domain ) {
+                            $matching_address = $header_address;
+                        }
+                    }
+                }
+
+                # Send report it not on skip list
+                if ( ! $self->check_skip_address( $matching_address ) ) {
+                    eval {
+                        $self->dbgout( 'DMARCReportTo', $rua, LOG_INFO );
+                        $dmarc->save_aggregate();
+                    };
+                    if ( my $error = $@ ) {
+                        $self->log_error( 'DMARC Report Error ' . $error );
+                    }
+                }
+                else {
+                    $self->dbgout( 'DMARCReportTo (skipped for address)', $rua, LOG_INFO );
                 }
             }
             else {
-                $self->dbgout( 'DMARCReportTo (skipped flag)', $rua, LOG_INFO );
+                $self->dbgout( 'DMARCReportTo (skipped)', $rua, LOG_INFO );
             }
-        }
-        else {
-            $self->dbgout( 'DMARCReportTo (skipped)', $rua, LOG_INFO );
         }
     }
 
@@ -359,6 +393,7 @@ sub get_dmarc_object {
 sub helo_callback {
     my ( $self, $helo_host ) = @_;
     $self->{'helo_name'} = $helo_host;
+    $self->{'dmarc_objects'} = [];
     return;
 }
 
@@ -406,17 +441,17 @@ sub envfrom_callback {
 }
 
 sub check_skip_address {
-    my ( $self, $env_to ) = @_;
-    $env_to = lc $self->get_address_from( $env_to );
+    my ( $self, $to ) = @_;
+    $to = lc $self->get_address_from( $to );
     my $config = $self->handler_config();
     return 0 if not exists( $config->{'report_skip_to'} );
     foreach my $address ( @{ $config->{'report_skip_to'} } ) {
-        if ( lc $address eq lc $env_to ) {
-            $self->dbgout( 'DMARCReportSkip', 'Skip address detected: ' . $env_to, LOG_INFO );
-            $self->{'skip_report'} = 1;
+        if ( lc $address eq lc $to ) {
+            $self->dbgout( 'DMARCReportSkip', 'Skip address detected: ' . $to, LOG_INFO );
+            return 1;
         }
     }
-    return;
+    return 0;
 }
 
 sub envrcpt_callback {
@@ -426,7 +461,6 @@ sub envrcpt_callback {
     return if ( $self->is_authenticated() );
 
     $self->{ 'env_to' } = $env_to;
-    $self->check_skip_address( $env_to );
 
     return;
 }
@@ -483,7 +517,7 @@ sub eom_callback {
     foreach my $from_header ( @$from_headers ) {
     my $from_header_header_domains = $self->get_domains_from( $from_header );
         foreach my $header_domain ( @$from_header_header_domains ) {
-        push @header_domains, $header_domain;
+            push @header_domains, $header_domain;
         }
     }
 
@@ -569,6 +603,11 @@ sub _add_dmarc_header {
 
 sub close_callback {
     my ( $self ) = @_;
+
+    # Save all the reports we have
+    $self->save_reports();
+
+    delete $self->{'dmarc_objects'};
     delete $self->{'helo_name'};
     delete $self->{'env_from'};
     delete $self->{'env_to'};
